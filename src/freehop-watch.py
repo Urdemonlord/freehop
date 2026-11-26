@@ -31,7 +31,10 @@ does not forget it. The FreeHop tunnel stays up in both modes: in
 direct mode it is the fallback, so doctor still checks it.
 A probe 200 short-circuits the run (healthy, skip the tunnel check).
 Limits: min interval, max per hour, max per day, stop after N consecutive
-failed runs. After a rotate, runs POST_ROTATE_HOOK (e.g. restart your
+failed runs. Every rotate attempt counts against the hourly/daily budget
+and advances the min-interval clock, success or not, so a burned exit
+cannot hammer the provider on every timer tick. After a rotate, runs
+POST_ROTATE_HOOK (e.g. restart your
 gateway so it drops its cached session), then runs TEST_CMD if set,
 retried for up to ~45s because a restarted gateway needs 9-37s before
 it listens again; exit 0 means the gateway works again. Overlapping
@@ -393,7 +396,10 @@ def main():
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     if st.get("day_start") != today:
         st["day_count"] = 0; st["day_start"] = today; st["consec_fail"] = 0
-    if now - st.get("hour_start", 0) >= 3600:
+    # Clock-skew guard: a future hour_start (NTP step back) would make the
+    # window look un-expired forever, so treat it as stale.
+    hour_start = st.get("hour_start", 0)
+    if hour_start > now or now - hour_start >= 3600:
         st["hour_count"] = 0; st["hour_start"] = now
     ensure_agent_alive()
     mode = st.get("gateway_mode", "proxy")
@@ -425,20 +431,44 @@ def main():
         log(f"{reason}, rotating")
     else:
         log("forced rotate")
-    if now - st.get("last_rotate", 0) < MIN_INTERVAL_MIN * 60 and not force:
+    # Throttle on the last *attempt*, not just the last success: a burned exit
+    # used to retry on every tick because last_rotate only advanced on a
+    # successful rotate. Clock-skew guard: a future timestamp is stale.
+    last_rotate = st.get("last_rotate", 0)
+    last_attempt = st.get("last_attempt", 0)
+    if last_rotate > now:
+        log(f"last_rotate {last_rotate} is in the future (clock skew), ignoring it")
+        last_rotate = 0; st["last_rotate"] = 0
+    if last_attempt > now:
+        log(f"last_attempt {last_attempt} is in the future (clock skew), ignoring it")
+        last_attempt = 0; st["last_attempt"] = 0
+    if now - max(last_rotate, last_attempt) < MIN_INTERVAL_MIN * 60 and not force:
         log(f"rotated <{MIN_INTERVAL_MIN} min ago, skip")
         return 0
-    if st.get("hour_count", 0) >= MAX_PER_HOUR:
-        log(f"hour limit {MAX_PER_HOUR} reached, skip")
-        return 0
-    if st.get("day_count", 0) >= MAX_PER_DAY:
-        log(f"day limit {MAX_PER_DAY} reached, skip")
-        return 0
-    if st.get("consec_fail", 0) >= MAX_CONSEC_FAIL:
-        log(f"{MAX_CONSEC_FAIL} consecutive failed runs, stop until tomorrow")
+
+    def budget_left():
+        if st.get("hour_count", 0) >= MAX_PER_HOUR:
+            log(f"hour limit {MAX_PER_HOUR} reached, skip"); return False
+        if st.get("day_count", 0) >= MAX_PER_DAY:
+            log(f"day limit {MAX_PER_DAY} reached, skip"); return False
+        if st.get("consec_fail", 0) >= MAX_CONSEC_FAIL:
+            log(f"{MAX_CONSEC_FAIL} consecutive failed runs, stop until tomorrow"); return False
+        return True
+
+    if not budget_left():
         return 0
     for attempt in range(1, 4):
+        if not budget_left():
+            break
         log(f"rotate attempt {attempt}/3")
+        # Charge every attempt to the budget BEFORE running it, success or
+        # not. The old code charged only successful rotates, so a burned exit
+        # could hammer the provider on every timer tick without ever spending
+        # the hourly/daily budget. This is the guardrail that stops that.
+        st["last_attempt"] = int(time.time())
+        st["hour_count"] = st.get("hour_count", 0) + 1
+        st["day_count"] = st.get("day_count", 0) + 1
+        save_state(st)
         rc, out, err = run([sys.executable, ROTATE_PY], timeout=180)
         log(f"rotate rc={rc} out={out[-200:]} err={err[-200:]}")
         if rc != 0:
@@ -463,14 +493,14 @@ def main():
         else:
             ok = True
         if ok:
-            st["last_rotate"] = int(time.time()); st["hour_count"] = st.get("hour_count", 0) + 1; st["day_count"] = st.get("day_count", 0) + 1; st["consec_fail"] = 0
+            st["last_rotate"] = int(time.time()); st["consec_fail"] = 0
             save_state(st)
             log("OK, back to 200" if TEST_CMD else "OK, rotated")
             return 0
         time.sleep(5)
     st["consec_fail"] = st.get("consec_fail", 0) + 1
     save_state(st)
-    log(f"still failing after 3 rotates, consec_fail={st['consec_fail']}")
+    log(f"still failing after rotate attempt(s), consec_fail={st['consec_fail']}")
     return 1
 
 if __name__ == "__main__":

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Watcher budget: charge every rotate attempt (success or not) to the
+  hourly/daily limit and advance the min-interval clock on the last
+  attempt (`last_attempt`) instead of only on a successful rotate. The
+  old behaviour charged only successes, so an exit that stayed burned
+  retried on every timer tick without ever spending the budget. Guard
+  the min-interval gate against a future `last_rotate`/`hour_start`/
+  `last_attempt` (NTP step back) so it cannot freeze forever.
+
 ## v0.7.0 (2026-11-24)
 
 - New egress method `warp`: each rotate registers a FRESH anonymous WARP device with wgcf (`wgcf register` + `wgcf generate`, random keypair + install_id, no personal account) and swaps the netns WireGuard peer to its profile, exactly like the Proton peer swap. Cloudflare assigns each new device a fresh IPv6 address; the rotate verifies the egress IPv6 /64 actually changed (via `WARP_EXIT_IP6_URL`, default api64.ipify.org) and retries with another fresh registration when the new egress /64 equals the previous one, up to 3 fresh registrations per rotate. The public IPv4 egress is Cloudflare's shared pool and may already be 429. `rotate --json` for warp also reports `exit_ip6`, `prefix64` (egress /64) and `profile_prefix64`. wgcf 2.3.1 is downloaded once (pinned release, SHA-256 verified); only the generated profile is kept (0600), the disposable account file is deleted right after generate. `doctor` gains warp checks (wgcf, profile, handshake, inside-ns egress, IPv6 exit). The old warp-cli daemon is NOT used by this method. LIVE RESULT 23 Nov: fresh egress v6 does NOT by itself give a 200 (warp rotate #1, egress v6 2a09:bac5:55fa:1d0f::2e5:65, gateway probe 429 while the same minute's Proton probe was 200; exit v4 was the already-burned shared 104.28.254.46). The gateway's upstream connection apparently goes over IPv4, or the v6 path is not what the upstream counts, so warp is NOT a working 429 escape as implemented. See GOAL.md for the full evidence and what would need proving before any live use.
